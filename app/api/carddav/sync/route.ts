@@ -2,22 +2,30 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { fetchiCloudContacts } from '@/lib/carddav'
 
+export const maxDuration = 60 // seconds (Vercel hobby: 60s max)
+
 // GET — return saved iCloud settings
 export async function GET() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+  // Select core columns first; selected_books may not exist if migration 003 hasn't run
   const { data } = await supabase
     .from('user_settings')
     .select('icloud_apple_id, icloud_last_synced_at, icloud_selected_books')
     .eq('user_id', user.id)
     .maybeSingle()
+    .then((r) => r.error
+      // Fall back without icloud_selected_books if column doesn't exist yet
+      ? supabase.from('user_settings').select('icloud_apple_id, icloud_last_synced_at').eq('user_id', user.id).maybeSingle()
+      : r,
+    )
 
   return NextResponse.json({
-    apple_id: data?.icloud_apple_id ?? null,
-    last_synced_at: data?.icloud_last_synced_at ?? null,
-    selected_books: (data?.icloud_selected_books as string[] | null) ?? [],
+    apple_id: (data as any)?.icloud_apple_id ?? null,
+    last_synced_at: (data as any)?.icloud_last_synced_at ?? null,
+    selected_books: (data as any)?.icloud_selected_books ?? [],
   })
 }
 
