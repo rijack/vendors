@@ -4,11 +4,22 @@ import { useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Button } from '@/components/ui/Button'
-import { Bell, Check, User, Database } from 'lucide-react'
+import { Bell, Check, User, Database, Cloud, RefreshCw, Unlink } from 'lucide-react'
 
 export default function SettingsPage() {
   const [user, setUser] = useState<any>(null)
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>('default')
+
+  // iCloud state
+  const [icloudSavedAppleId, setIcloudSavedAppleId] = useState<string | null>(null)
+  const [icloudLastSynced, setIcloudLastSynced] = useState<string | null>(null)
+  const [icloudAppleId, setIcloudAppleId] = useState('')
+  const [icloudPassword, setIcloudPassword] = useState('')
+  const [icloudSave, setIcloudSave] = useState(true)
+  const [icloudSyncing, setIcloudSyncing] = useState(false)
+  const [icloudResult, setIcloudResult] = useState<{ total: number; created: number; updated: number; skipped: number } | null>(null)
+  const [icloudError, setIcloudError] = useState('')
+  const [showIcloudForm, setShowIcloudForm] = useState(false)
 
   const supabase = createClient()
 
@@ -17,6 +28,13 @@ export default function SettingsPage() {
     if ('Notification' in window) {
       setNotificationPermission(Notification.permission)
     }
+    fetch('/api/carddav/sync')
+      .then((r) => r.json())
+      .then((d) => {
+        setIcloudSavedAppleId(d.apple_id ?? null)
+        setIcloudLastSynced(d.last_synced_at ?? null)
+      })
+      .catch(() => {})
   }, [])
 
   async function requestNotifications() {
@@ -27,6 +45,48 @@ export default function SettingsPage() {
         body: 'Notifications are enabled! You will now receive reminders.',
       })
     }
+  }
+
+  async function handleIcloudSync() {
+    setIcloudSyncing(true)
+    setIcloudError('')
+    setIcloudResult(null)
+    try {
+      const body: Record<string, unknown> = { save: icloudSave }
+      if (!icloudSavedAppleId || showIcloudForm) {
+        body.apple_id = icloudAppleId
+        body.app_password = icloudPassword
+      }
+      const res = await fetch('/api/carddav/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setIcloudError(data.error ?? 'Sync failed')
+      } else {
+        setIcloudResult(data)
+        setIcloudLastSynced(new Date().toISOString())
+        if (icloudSave && icloudAppleId) {
+          setIcloudSavedAppleId(icloudAppleId)
+          setShowIcloudForm(false)
+        }
+      }
+    } catch {
+      setIcloudError('Network error — please try again')
+    }
+    setIcloudSyncing(false)
+  }
+
+  async function handleIcloudDisconnect() {
+    await fetch('/api/carddav/sync', { method: 'DELETE' })
+    setIcloudSavedAppleId(null)
+    setIcloudLastSynced(null)
+    setIcloudResult(null)
+    setIcloudAppleId('')
+    setIcloudPassword('')
+    setShowIcloudForm(false)
   }
 
   async function handleSignOut() {
@@ -112,20 +172,108 @@ export default function SettingsPage() {
             </div>
           </div>
 
-          {/* macOS Companion */}
+          {/* iCloud Contacts */}
           <div className="bg-white rounded-xl border border-gray-200 p-5">
             <div className="flex items-center gap-2 mb-4">
-              <svg className="w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z" />
-              </svg>
-              <h2 className="text-sm font-semibold text-gray-900">macOS Companion App</h2>
+              <Cloud className="w-4 h-4 text-gray-400" />
+              <h2 className="text-sm font-semibold text-gray-900">iCloud Contacts</h2>
             </div>
-            <p className="text-sm text-gray-500 mb-3">
-              The optional macOS Electron companion app provides bi-directional sync with your macOS Contacts app and native push notifications for reminders.
-            </p>
-            <div className="bg-amber-50 rounded-lg p-3 text-xs text-amber-700">
-              Coming soon — the companion app is in development.
-            </div>
+
+            {icloudSavedAppleId && !showIcloudForm ? (
+              <div className="space-y-3">
+                <div>
+                  <label className="text-xs text-gray-500">Connected as</label>
+                  <p className="text-sm font-medium text-gray-900 mt-0.5">{icloudSavedAppleId}</p>
+                </div>
+                {icloudLastSynced && (
+                  <div>
+                    <label className="text-xs text-gray-500">Last synced</label>
+                    <p className="text-sm text-gray-700 mt-0.5">
+                      {new Date(icloudLastSynced).toLocaleString()}
+                    </p>
+                  </div>
+                )}
+                {icloudResult && (
+                  <div className="bg-green-50 rounded-lg p-3 text-xs text-green-700">
+                    Synced {icloudResult.total} contacts — {icloudResult.created} added, {icloudResult.updated} updated
+                    {icloudResult.skipped > 0 && `, ${icloudResult.skipped} skipped`}
+                  </div>
+                )}
+                {icloudError && (
+                  <p className="text-xs text-red-600">{icloudError}</p>
+                )}
+                <div className="flex items-center gap-2 pt-1">
+                  <Button size="sm" onClick={handleIcloudSync} loading={icloudSyncing}>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Sync now
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => setShowIcloudForm(true)}>
+                    Update credentials
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={handleIcloudDisconnect}>
+                    <Unlink className="w-3.5 h-3.5" />
+                    Disconnect
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-sm text-gray-500">
+                  Sync your iCloud contacts directly — no file export needed. Requires an app-specific password.
+                </p>
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Apple ID</label>
+                  <input
+                    type="email"
+                    value={icloudAppleId}
+                    onChange={(e) => setIcloudAppleId(e.target.value)}
+                    placeholder="you@icloud.com"
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">App-specific password</label>
+                  <input
+                    type="password"
+                    value={icloudPassword}
+                    onChange={(e) => setIcloudPassword(e.target.value)}
+                    placeholder="xxxx-xxxx-xxxx-xxxx"
+                    className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <p className="text-xs text-gray-400 mt-1">
+                    Generate one at <span className="font-medium">appleid.apple.com</span> → Sign-In and Security → App-Specific Passwords
+                  </p>
+                </div>
+                <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={icloudSave}
+                    onChange={(e) => setIcloudSave(e.target.checked)}
+                    className="rounded"
+                  />
+                  Remember credentials
+                </label>
+                {icloudError && (
+                  <p className="text-xs text-red-600">{icloudError}</p>
+                )}
+                <div className="flex items-center gap-2 pt-1">
+                  <Button
+                    size="sm"
+                    onClick={handleIcloudSync}
+                    loading={icloudSyncing}
+                    disabled={!icloudAppleId || !icloudPassword}
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Sync contacts
+                  </Button>
+                  {showIcloudForm && (
+                    <Button variant="outline" size="sm" onClick={() => setShowIcloudForm(false)}>
+                      Cancel
+                    </Button>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
 
         </div>
