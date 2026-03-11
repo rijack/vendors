@@ -1,0 +1,40 @@
+{
+  "name": "vendor-tracker-companion",
+  "version": "0.1.0",
+  "description": "macOS Contacts sync companion for Vendor Tracker",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "tsc && electron .",
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "start": "electron .",
+    "package": "tsc && electron-builder --mac"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.99.0",
+    "electron-store": "^8.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "electron": "^35.0.0",
+    "electron-builder": "^26.0.0",
+    "typescript": "^5.0.0"
+  },
+  "build": {
+    "appId": "com.vendortracker.companion",
+    "productName": "Vendor Tracker",
+    "files": [
+      "dist/**/*",
+      "src/index.html",
+      "assets/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": "dmg",
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "hardenedRuntime": true
+    }
+  }
+}
