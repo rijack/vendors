@@ -73,30 +73,41 @@ function xmlResponses(xml: string): string[] {
 }
 
 async function resolveAddressBookHome(auth: string): Promise<string> {
-  // Step 1: well-known → get current-user-principal
-  const xml1 = await davFetch(
-    'PROPFIND',
-    'https://contacts.icloud.com/.well-known/carddav',
-    auth,
-    `<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop><D:current-user-principal/></D:prop></D:propfind>`,
-  )
-  const principalTag = xmlTag(xml1, 'current-user-principal')
-  const principalHref = principalTag ? xmlHref(principalTag) : null
-  if (!principalHref) throw new Error(`iCloud CardDAV: could not find principal URL. Response: ${xml1.slice(0, 400)}`)
-  const principalUrl = principalHref.startsWith('http')
-    ? principalHref
-    : `https://contacts.icloud.com${principalHref}`
+  // iCloud's well-known endpoint redirects (via GET) to the user-specific CardDAV root.
+  // We use GET + redirect:follow so fetch resolves the final URL automatically.
+  const getRes = await fetch('https://contacts.icloud.com/.well-known/carddav', {
+    method: 'GET',
+    headers: { Authorization: auth },
+    redirect: 'follow',
+  })
 
-  // Step 2: principal → addressbook-home-set
-  const xml2 = await davFetch(
+  if (getRes.status === 401) {
+    throw new Error('Invalid Apple ID or app-specific password (401 Unauthorized)')
+  }
+
+  // The final URL after redirects is the user's CardDAV root
+  // e.g. https://contacts.icloud.com/1234567890/carddav/
+  const rootUrl = getRes.url
+
+  if (!rootUrl || rootUrl.includes('.well-known')) {
+    throw new Error(
+      `iCloud CardDAV: discovery redirect failed — ended up at ${rootUrl}. Check your Apple ID and app-specific password.`,
+    )
+  }
+
+  // Ask this root for the addressbook-home-set
+  const xml = await davFetch(
     'PROPFIND',
-    principalUrl,
+    rootUrl,
     auth,
     `<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:prop><C:addressbook-home-set/></D:prop></D:propfind>`,
   )
-  const homeTag = xmlTag(xml2, 'addressbook-home-set')
+  const homeTag = xmlTag(xml, 'addressbook-home-set')
   const homeHref = homeTag ? xmlHref(homeTag) : null
-  if (!homeHref) throw new Error('iCloud CardDAV: could not find addressbook-home-set')
+
+  // Fall back to rootUrl itself if addressbook-home-set isn't exposed
+  if (!homeHref) return rootUrl
+
   return homeHref.startsWith('http') ? homeHref : `https://contacts.icloud.com${homeHref}`
 }
 
