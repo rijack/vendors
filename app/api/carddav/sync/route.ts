@@ -87,8 +87,8 @@ export async function POST(req: Request) {
       const memberUids = liveGroups
         .filter((g) => savedGroupUids.includes(g.uid))
         .flatMap((g) => g.memberUids)
-      if (memberUids.length > 0) {
-        uidsToFilter = [...new Set(memberUids)]
+      uidsToFilter = [...new Set(memberUids)]
+      if (uidsToFilter.length > 0) {
         // Persist updated membership so manual sync stays in sync too
         await supabase
           .from('user_settings')
@@ -97,6 +97,14 @@ export async function POST(req: Request) {
     } catch {
       // Fall back to saved UIDs if group re-fetch fails
     }
+  }
+
+  // If a specific list/contacts mode was intended but resolved to nothing, sync nothing
+  const isFilteredMode = savedGroupUids.length > 0 ||
+    (((settings as any)?.icloud_selected_contacts as string[] | null) ?? []).length > 0 ||
+    selectedContacts !== undefined
+  if (isFilteredMode && uidsToFilter.length === 0) {
+    return NextResponse.json({ total: 0, created: 0, updated: 0, skipped: 0, errors: [] })
   }
 
   // Fetch from iCloud

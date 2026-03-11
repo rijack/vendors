@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Plus, Users, Filter, RefreshCw, ChevronUp, ChevronDown, ChevronsUpDown, Trash2, Mail, Phone } from 'lucide-react'
+import { Plus, Users, Filter, RefreshCw, ChevronUp, ChevronDown, ChevronsUpDown, Trash2, Mail, Phone, Linkedin, Loader2, ExternalLink, Check, X } from 'lucide-react'
 import { createClient } from '@/lib/supabase/client'
 import { ContactForm } from '@/components/contacts/ContactForm'
 import { PageHeader } from '@/components/ui/PageHeader'
@@ -25,6 +25,17 @@ export default function ContactsPage() {
   const [deleting, setDeleting] = useState(false)
   const [sortKey, setSortKey] = useState<'name' | 'company' | 'role' | 'email' | 'phone'>('name')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
+
+  // LinkedIn lookup state
+  const [linkedinContact, setLinkedinContact] = useState<Contact | null>(null)
+  const [linkedinLoading, setLinkedinLoading] = useState(false)
+  const [linkedinResult, setLinkedinResult] = useState<{
+    linkedin_url?: string
+    role?: string
+    location?: string
+    notes?: string
+  } | null>(null)
+  const [linkedinApplying, setLinkedinApplying] = useState(false)
 
   // iCloud sync state
   const [icloudConnected, setIcloudConnected] = useState(false)
@@ -196,6 +207,47 @@ export default function ContactsPage() {
   }
 
 
+  async function handleLinkedinLookup(contact: Contact) {
+    setLinkedinContact(contact)
+    setLinkedinResult(null)
+    setLinkedinLoading(true)
+    try {
+      const res = await fetch('/api/linkedin/lookup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: contact.name, company: contact.company }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error)
+      setLinkedinResult(data)
+    } catch (err: any) {
+      addToast('error', `LinkedIn lookup failed: ${err.message}`)
+      setLinkedinContact(null)
+    } finally {
+      setLinkedinLoading(false)
+    }
+  }
+
+  async function applyLinkedinResult() {
+    if (!linkedinContact || !linkedinResult) return
+    setLinkedinApplying(true)
+    const updates: Record<string, string | null> = {}
+    if (linkedinResult.role && !linkedinContact.role) updates.role = linkedinResult.role
+    else if (linkedinResult.role) updates.role = linkedinResult.role
+    if (linkedinResult.location && !linkedinContact.location) updates.location = linkedinResult.location
+    if (linkedinResult.notes) {
+      const existing = linkedinContact as any
+      const currentNotes = existing.notes ?? ''
+      updates.notes = currentNotes ? `${currentNotes}\n${linkedinResult.notes}` : linkedinResult.notes
+    }
+    await supabase.from('contacts').update(updates).eq('id', linkedinContact.id)
+    setLinkedinApplying(false)
+    setLinkedinContact(null)
+    setLinkedinResult(null)
+    fetchContacts()
+    addToast('success', 'Profile updated from LinkedIn')
+  }
+
   function handleSort(key: typeof sortKey) {
     if (sortKey === key) setSortDir((d) => d === 'asc' ? 'desc' : 'asc')
     else { setSortKey(key); setSortDir('asc') }
@@ -337,7 +389,16 @@ export default function ContactsPage() {
                       : <span className="text-gray-300">—</span>}
                   </td>
                   <td className="px-4 py-3">
-                    <div className="flex items-center justify-end opacity-0 group-hover:opacity-100 transition-opacity">
+                    <div className="flex items-center justify-end gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleLinkedinLookup(contact) }}
+                        title="Find on LinkedIn"
+                        className="p-1.5 rounded hover:bg-blue-50 text-gray-400 hover:text-blue-600"
+                      >
+                        {linkedinLoading && linkedinContact?.id === contact.id
+                          ? <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                          : <Linkedin className="w-3.5 h-3.5" />}
+                      </button>
                       <button onClick={(e) => { e.stopPropagation(); setDeleteContact(contact) }} className="p-1.5 rounded hover:bg-red-100 text-gray-400 hover:text-red-600">
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -369,6 +430,80 @@ export default function ContactsPage() {
         />
       )}
 
+
+      {/* LinkedIn result modal */}
+      <Modal
+        open={!!linkedinContact && !linkedinLoading && !!linkedinResult}
+        onClose={() => { setLinkedinContact(null); setLinkedinResult(null) }}
+        title={`LinkedIn: ${linkedinContact?.name}`}
+        size="sm"
+        footer={
+          <>
+            <Button variant="outline" onClick={() => { setLinkedinContact(null); setLinkedinResult(null) }}>
+              <X className="w-4 h-4" />
+              Discard
+            </Button>
+            <Button onClick={applyLinkedinResult} loading={linkedinApplying}>
+              <Check className="w-4 h-4" />
+              Apply to Contact
+            </Button>
+          </>
+        }
+      >
+        {linkedinResult && (
+          <div className="space-y-3 text-sm">
+            {linkedinResult.linkedin_url && (
+              <div className="flex items-start gap-2">
+                <Linkedin className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+                <a
+                  href={linkedinResult.linkedin_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-blue-600 hover:underline flex items-center gap-1 break-all"
+                >
+                  {linkedinResult.linkedin_url}
+                  <ExternalLink className="w-3 h-3 shrink-0" />
+                </a>
+              </div>
+            )}
+            {linkedinResult.role && (
+              <div>
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-0.5">Role / Title</p>
+                <p className="text-gray-800">{linkedinResult.role}</p>
+                {linkedinContact?.role && linkedinContact.role !== linkedinResult.role && (
+                  <p className="text-xs text-amber-600 mt-0.5">Current value: {linkedinContact.role}</p>
+                )}
+              </div>
+            )}
+            {linkedinResult.location && (
+              <div>
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-0.5">Location</p>
+                <p className="text-gray-800">{linkedinResult.location}</p>
+              </div>
+            )}
+            {linkedinResult.notes && (
+              <div>
+                <p className="text-xs font-medium text-gray-500 uppercase tracking-wide mb-0.5">Additional Info</p>
+                <p className="text-gray-600">{linkedinResult.notes}</p>
+              </div>
+            )}
+            {!linkedinResult.role && !linkedinResult.location && !linkedinResult.notes && !linkedinResult.linkedin_url && (
+              <p className="text-gray-500">No profile information found for this contact.</p>
+            )}
+            <div className="pt-1 border-t border-gray-100">
+              <a
+                href={`https://www.linkedin.com/search/results/people/?keywords=${encodeURIComponent(`${linkedinContact?.name ?? ''} ${linkedinContact?.company ?? ''}`.trim())}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-xs text-blue-600 hover:underline flex items-center gap-1"
+              >
+                <ExternalLink className="w-3 h-3" />
+                Search manually on LinkedIn
+              </a>
+            </div>
+          </div>
+        )}
+      </Modal>
 
       {/* Delete confirm */}
       <Modal

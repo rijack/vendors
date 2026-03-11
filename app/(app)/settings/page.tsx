@@ -152,14 +152,23 @@ export default function SettingsPage() {
     setSyncError('')
     const body: Record<string, unknown> = {}
     if (syncMode === 'lists') {
-      // Resolve group member UIDs
-      const memberUids = groups
-        .filter((g) => selectedGroups.includes(g.uid))
-        .flatMap((g) => g.memberUids)
-      const uniqueUids = [...new Set(memberUids)]
-      body.selected_contacts = uniqueUids
-      body.selected_books = []
-      body.selected_groups = selectedGroups // saved for UI restoration
+      if (groups.length > 0) {
+        // Resolve group member UIDs from loaded groups data
+        const memberUids = groups
+          .filter((g) => selectedGroups.includes(g.uid))
+          .flatMap((g) => g.memberUids)
+        const uniqueUids = [...new Set(memberUids)]
+        if (uniqueUids.length === 0) {
+          setSyncError('The selected list has no contacts to sync.')
+          setSyncing(false)
+          return
+        }
+        body.selected_contacts = uniqueUids
+        body.selected_books = []
+        body.selected_groups = selectedGroups // saved for UI restoration
+      }
+      // If groups aren't loaded (connected phase), server re-resolves membership
+      // from saved settings — if it comes back empty, server will sync nothing
     } else if (syncMode === 'contacts') {
       body.selected_books = []
       body.selected_contacts = selectedContacts
