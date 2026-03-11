@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Button } from '@/components/ui/Button'
-import { Bell, Check, User, Database, Cloud, RefreshCw, Unlink } from 'lucide-react'
+import { Bell, Check, User, Database, Cloud, RefreshCw, Unlink, ChevronDown, ChevronUp, List } from 'lucide-react'
 
 export default function SettingsPage() {
   const [user, setUser] = useState<any>(null)
@@ -20,6 +20,13 @@ export default function SettingsPage() {
   const [icloudResult, setIcloudResult] = useState<{ total: number; created: number; updated: number; skipped: number } | null>(null)
   const [icloudError, setIcloudError] = useState('')
   const [showIcloudForm, setShowIcloudForm] = useState(false)
+
+  // Book picker state
+  const [showBookPicker, setShowBookPicker] = useState(false)
+  const [books, setBooks] = useState<{ url: string; name: string }[]>([])
+  const [booksLoading, setBooksLoading] = useState(false)
+  const [booksError, setBooksError] = useState('')
+  const [selectedBooks, setSelectedBooks] = useState<string[]>([]) // empty = all
 
   const supabase = createClient()
 
@@ -42,6 +49,7 @@ export default function SettingsPage() {
       .then((d) => {
         setIcloudSavedAppleId(d.apple_id ?? null)
         setIcloudLastSynced(d.last_synced_at ?? null)
+        setSelectedBooks(d.selected_books ?? [])
       })
       .catch(() => {})
   }, [])
@@ -54,6 +62,48 @@ export default function SettingsPage() {
         body: 'Notifications are enabled! You will now receive reminders.',
       })
     }
+  }
+
+  async function handleOpenBookPicker() {
+    setShowBookPicker(true)
+    if (books.length > 0) return
+    setBooksLoading(true)
+    setBooksError('')
+    try {
+      const res = await fetch('/api/carddav/books')
+      const data = await res.json()
+      if (!res.ok) setBooksError(data.error ?? 'Failed to load lists')
+      else setBooks(data.books ?? [])
+    } catch {
+      setBooksError('Network error')
+    }
+    setBooksLoading(false)
+  }
+
+  function toggleBook(url: string) {
+    setSelectedBooks((prev) =>
+      prev.includes(url) ? prev.filter((u) => u !== url) : [...prev, url],
+    )
+  }
+
+  async function handleSaveBooks() {
+    setIcloudSyncing(true)
+    setIcloudError('')
+    setIcloudResult(null)
+    setShowBookPicker(false)
+    try {
+      const res = await fetch('/api/carddav/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ selected_books: selectedBooks }),
+      })
+      const data = await res.json()
+      if (!res.ok) setIcloudError(data.error ?? 'Sync failed')
+      else { setIcloudResult(data); setIcloudLastSynced(new Date().toISOString()) }
+    } catch {
+      setIcloudError('Network error')
+    }
+    setIcloudSyncing(false)
   }
 
   async function handleIcloudSync() {
@@ -157,16 +207,79 @@ export default function SettingsPage() {
 
             {icloudSavedAppleId && !showIcloudForm ? (
               <div className="space-y-3">
-                <div>
-                  <label className="text-xs text-gray-500">Connected as</label>
-                  <p className="text-sm font-medium text-gray-900 mt-0.5">{icloudSavedAppleId}</p>
-                </div>
-                {icloudLastSynced && (
+                <div className="flex items-start justify-between">
                   <div>
-                    <label className="text-xs text-gray-500">Last synced</label>
-                    <p className="text-sm text-gray-700 mt-0.5">{new Date(icloudLastSynced).toLocaleString()}</p>
+                    <label className="text-xs text-gray-500">Connected as</label>
+                    <p className="text-sm font-medium text-gray-900 mt-0.5">{icloudSavedAppleId}</p>
                   </div>
-                )}
+                  {icloudLastSynced && (
+                    <div className="text-right">
+                      <label className="text-xs text-gray-500">Last synced</label>
+                      <p className="text-xs text-gray-600 mt-0.5">{new Date(icloudLastSynced).toLocaleString()}</p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Book picker */}
+                <div className="border border-gray-200 rounded-lg overflow-hidden">
+                  <button
+                    onClick={showBookPicker ? () => setShowBookPicker(false) : handleOpenBookPicker}
+                    className="w-full flex items-center justify-between px-3 py-2.5 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                  >
+                    <span className="flex items-center gap-2">
+                      <List className="w-3.5 h-3.5 text-gray-400" />
+                      {selectedBooks.length === 0
+                        ? 'All lists'
+                        : `${selectedBooks.length} list${selectedBooks.length !== 1 ? 's' : ''} selected`}
+                    </span>
+                    {showBookPicker ? <ChevronUp className="w-3.5 h-3.5 text-gray-400" /> : <ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
+                  </button>
+
+                  {showBookPicker && (
+                    <div className="border-t border-gray-200 bg-gray-50 p-3 space-y-2">
+                      {booksLoading ? (
+                        <p className="text-xs text-gray-400 py-1">Loading lists...</p>
+                      ) : booksError ? (
+                        <p className="text-xs text-red-600">{booksError}</p>
+                      ) : (
+                        <>
+                          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer hover:text-gray-900">
+                            <input
+                              type="checkbox"
+                              checked={selectedBooks.length === 0}
+                              onChange={() => setSelectedBooks([])}
+                              className="rounded"
+                            />
+                            <span className="font-medium">All lists</span>
+                          </label>
+                          <div className="border-t border-gray-200 pt-2 space-y-1.5">
+                            {books.map((book) => (
+                              <label key={book.url} className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer hover:text-gray-900">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedBooks.includes(book.url)}
+                                  onChange={() => toggleBook(book.url)}
+                                  className="rounded"
+                                />
+                                {book.name}
+                              </label>
+                            ))}
+                          </div>
+                          <div className="flex gap-2 pt-1 border-t border-gray-200">
+                            <Button size="sm" onClick={handleSaveBooks} loading={icloudSyncing}>
+                              <RefreshCw className="w-3 h-3" />
+                              Save & sync
+                            </Button>
+                            <Button variant="outline" size="sm" onClick={() => setShowBookPicker(false)}>
+                              Cancel
+                            </Button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 {icloudResult && (
                   <div className="bg-green-50 rounded-lg p-3 text-xs text-green-700">
                     Synced {icloudResult.total} contacts — {icloudResult.created} added, {icloudResult.updated} updated

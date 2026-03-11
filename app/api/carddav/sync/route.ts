@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 import { fetchiCloudContacts } from '@/lib/carddav'
 
-// GET — return saved iCloud settings (apple_id masked, last_synced_at)
+// GET — return saved iCloud settings
 export async function GET() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
@@ -10,19 +10,19 @@ export async function GET() {
 
   const { data } = await supabase
     .from('user_settings')
-    .select('icloud_apple_id, icloud_last_synced_at')
+    .select('icloud_apple_id, icloud_last_synced_at, icloud_selected_books')
     .eq('user_id', user.id)
     .maybeSingle()
 
   return NextResponse.json({
     apple_id: data?.icloud_apple_id ?? null,
     last_synced_at: data?.icloud_last_synced_at ?? null,
+    selected_books: (data?.icloud_selected_books as string[] | null) ?? [],
   })
 }
 
-// POST — sync iCloud contacts into Supabase
-// Body: { apple_id?, app_password?, save?: boolean }
-// If apple_id/app_password are omitted, uses previously saved credentials.
+// POST — sync iCloud contacts
+// Body: { apple_id?, app_password?, save?: boolean, selected_books?: string[] }
 export async function POST(req: Request) {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
@@ -32,53 +32,64 @@ export async function POST(req: Request) {
   let appleId: string = body.apple_id ?? ''
   let appPassword: string = body.app_password ?? ''
   const save: boolean = body.save ?? false
+  const selectedBooks: string[] | undefined = body.selected_books // undefined = don't change
 
-  // Fall back to saved credentials if none provided
+  // Load saved settings
+  const { data: settings } = await supabase
+    .from('user_settings')
+    .select('icloud_apple_id, icloud_app_password, icloud_selected_books')
+    .eq('user_id', user.id)
+    .maybeSingle()
+
   if (!appleId || !appPassword) {
-    const { data: settings } = await supabase
-      .from('user_settings')
-      .select('icloud_apple_id, icloud_app_password')
-      .eq('user_id', user.id)
-      .maybeSingle()
     appleId = settings?.icloud_apple_id ?? ''
     appPassword = settings?.icloud_app_password ?? ''
   }
 
   if (!appleId || !appPassword) {
-    return NextResponse.json(
-      { error: 'No iCloud credentials provided or saved' },
-      { status: 400 },
-    )
+    return NextResponse.json({ error: 'No iCloud credentials provided or saved' }, { status: 400 })
   }
+
+  // Determine which books to sync: use body value if provided, else use saved
+  const booksToSync: string[] =
+    selectedBooks !== undefined
+      ? selectedBooks
+      : ((settings?.icloud_selected_books as string[] | null) ?? [])
 
   // Fetch from iCloud
   let icloudContacts
   try {
-    icloudContacts = await fetchiCloudContacts(appleId, appPassword)
+    icloudContacts = await fetchiCloudContacts(
+      appleId,
+      appPassword,
+      booksToSync.length > 0 ? booksToSync : undefined,
+    )
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     return NextResponse.json({ error: message }, { status: 400 })
   }
 
-  // Save credentials if requested
+  // Persist credentials and/or book selection
+  const upsertData: Record<string, unknown> = { user_id: user.id }
   if (save) {
-    await supabase.from('user_settings').upsert(
-      { user_id: user.id, icloud_apple_id: appleId, icloud_app_password: appPassword },
-      { onConflict: 'user_id' },
-    )
+    upsertData.icloud_apple_id = appleId
+    upsertData.icloud_app_password = appPassword
+  }
+  if (selectedBooks !== undefined) {
+    upsertData.icloud_selected_books = selectedBooks
+  }
+  if (Object.keys(upsertData).length > 1) {
+    await supabase.from('user_settings').upsert(upsertData, { onConflict: 'user_id' })
   }
 
-  // Load existing iCloud-linked contacts (matched by macos_contact_id = iCloud UID)
+  // Upsert contacts
   const { data: existing } = await supabase
     .from('contacts')
     .select('id, macos_contact_id')
     .not('macos_contact_id', 'is', null)
   const byUid = new Map((existing ?? []).map((c) => [c.macos_contact_id, c.id]))
 
-  let created = 0
-  let updated = 0
-  let skipped = 0
-
+  let created = 0, updated = 0, skipped = 0
   for (const c of icloudContacts) {
     const existingId = byUid.get(c.uid)
     const row = {
@@ -99,7 +110,6 @@ export async function POST(req: Request) {
     }
   }
 
-  // Record last synced time
   await supabase.from('user_settings').upsert(
     { user_id: user.id, icloud_last_synced_at: new Date().toISOString() },
     { onConflict: 'user_id' },
@@ -108,7 +118,7 @@ export async function POST(req: Request) {
   return NextResponse.json({ total: icloudContacts.length, created, updated, skipped })
 }
 
-// DELETE — remove saved iCloud credentials
+// DELETE — remove saved iCloud credentials and selection
 export async function DELETE() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
@@ -116,7 +126,7 @@ export async function DELETE() {
 
   await supabase
     .from('user_settings')
-    .update({ icloud_apple_id: null, icloud_app_password: null })
+    .update({ icloud_apple_id: null, icloud_app_password: null, icloud_selected_books: [] })
     .eq('user_id', user.id)
 
   return NextResponse.json({ ok: true })
