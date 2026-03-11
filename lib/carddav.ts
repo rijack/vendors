@@ -38,9 +38,12 @@ async function davFetch(
       currentUrl = loc.startsWith('http') ? loc : new URL(loc, currentUrl).href
       continue
     }
+    if (res.status === 401) {
+      throw new Error('Invalid Apple ID or app-specific password (401 Unauthorized)')
+    }
     if (res.status !== 207 && !res.ok) {
       const text = await res.text()
-      throw new Error(`CardDAV ${method} ${currentUrl} → ${res.status}: ${text.slice(0, 200)}`)
+      throw new Error(`CardDAV ${method} → ${res.status}: ${text.slice(0, 300)}`)
     }
     return res.text()
   }
@@ -79,7 +82,7 @@ async function resolveAddressBookHome(auth: string): Promise<string> {
   )
   const principalTag = xmlTag(xml1, 'current-user-principal')
   const principalHref = principalTag ? xmlHref(principalTag) : null
-  if (!principalHref) throw new Error('iCloud CardDAV: could not find principal URL — check your Apple ID and app-specific password')
+  if (!principalHref) throw new Error(`iCloud CardDAV: could not find principal URL. Response: ${xml1.slice(0, 400)}`)
   const principalUrl = principalHref.startsWith('http')
     ? principalHref
     : `https://contacts.icloud.com${principalHref}`
