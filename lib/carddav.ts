@@ -211,7 +211,7 @@ function parseVCard(raw: string): CardDAVContact | null {
   }
 }
 
-async function fetchContactsFromBook(bookUrl: string, auth: string): Promise<CardDAVContact[]> {
+async function fetchContactsFromBookInternal(bookUrl: string, auth: string): Promise<CardDAVContact[]> {
   const xml = await davFetch(
     'REPORT',
     bookUrl,
@@ -238,6 +238,16 @@ async function fetchContactsFromBook(bookUrl: string, auth: string): Promise<Car
   return contacts
 }
 
+// Public wrapper: fetch contacts from a single address book by URL
+export async function fetchContactsFromBook(
+  appleId: string,
+  appPassword: string,
+  bookUrl: string,
+): Promise<CardDAVContact[]> {
+  const auth = basicAuth(appleId, appPassword)
+  return fetchContactsFromBookInternal(bookUrl, auth)
+}
+
 // Returns all available address books for the account
 export async function fetchAddressBooks(
   appleId: string,
@@ -248,11 +258,12 @@ export async function fetchAddressBooks(
   return listBooks(homeUrl, auth)
 }
 
-// Fetches contacts, optionally filtered to specific address book URLs
+// Fetches contacts, optionally filtered to specific address book URLs and/or specific contact UIDs
 export async function fetchiCloudContacts(
   appleId: string,
   appPassword: string,
-  selectedBookUrls?: string[], // undefined or empty = sync all
+  selectedBookUrls?: string[], // undefined or empty = sync all books
+  selectedUids?: string[], // if non-empty, only return contacts with these UIDs
 ): Promise<CardDAVContact[]> {
   const auth = basicAuth(appleId, appPassword)
   const homeUrl = await resolveAddressBookHome(auth)
@@ -267,8 +278,13 @@ export async function fetchiCloudContacts(
 
   const contacts: CardDAVContact[] = []
   for (const book of booksToSync) {
-    const bookContacts = await fetchContactsFromBook(book.url, auth)
+    const bookContacts = await fetchContactsFromBookInternal(book.url, auth)
     contacts.push(...bookContacts)
   }
+
+  if (selectedUids && selectedUids.length > 0) {
+    return contacts.filter((c) => selectedUids.includes(c.uid))
+  }
+
   return contacts
 }

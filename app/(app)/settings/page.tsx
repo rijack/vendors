@@ -4,29 +4,39 @@ import { useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Button } from '@/components/ui/Button'
-import { Bell, Check, User, Database, Cloud, RefreshCw, Unlink, ChevronDown, ChevronUp, List } from 'lucide-react'
+import { Bell, Check, User, Database, Cloud, RefreshCw, Unlink, CheckCircle2, ChevronDown, ChevronUp, List } from 'lucide-react'
+
+type ICloudPhase = 'form' | 'picking' | 'connected'
 
 export default function SettingsPage() {
   const [user, setUser] = useState<any>(null)
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>('default')
 
-  // iCloud state
-  const [icloudSavedAppleId, setIcloudSavedAppleId] = useState<string | null>(null)
-  const [icloudLastSynced, setIcloudLastSynced] = useState<string | null>(null)
+  // iCloud phase
+  const [icloudPhase, setIcloudPhase] = useState<ICloudPhase>('form')
+
+  // form state
   const [icloudAppleId, setIcloudAppleId] = useState('')
   const [icloudPassword, setIcloudPassword] = useState('')
   const [icloudSave, setIcloudSave] = useState(true)
-  const [icloudSyncing, setIcloudSyncing] = useState(false)
-  const [icloudResult, setIcloudResult] = useState<{ total: number; created: number; updated: number; skipped: number } | null>(null)
-  const [icloudError, setIcloudError] = useState('')
-  const [showIcloudForm, setShowIcloudForm] = useState(false)
+  const [connecting, setConnecting] = useState(false)
+  const [connectError, setConnectError] = useState('')
 
-  // Book picker state
-  const [showBookPicker, setShowBookPicker] = useState(false)
+  // picking state
   const [books, setBooks] = useState<{ url: string; name: string }[]>([])
-  const [booksLoading, setBooksLoading] = useState(false)
-  const [booksError, setBooksError] = useState('')
-  const [selectedBooks, setSelectedBooks] = useState<string[]>([]) // empty = all
+  const [syncMode, setSyncMode] = useState<'all' | 'lists' | 'contacts'>('all')
+  const [selectedBooks, setSelectedBooks] = useState<string[]>([])
+  const [expandedBook, setExpandedBook] = useState<string | null>(null)
+  const [bookContacts, setBookContacts] = useState<Record<string, { uid: string; name: string; email: string | null; company: string | null }[]>>({})
+  const [contactsLoading, setContactsLoading] = useState(false)
+  const [selectedContacts, setSelectedContacts] = useState<string[]>([])
+  const [syncing, setSyncing] = useState(false)
+  const [syncError, setSyncError] = useState('')
+
+  // connected state
+  const [icloudSavedAppleId, setIcloudSavedAppleId] = useState<string | null>(null)
+  const [icloudLastSynced, setIcloudLastSynced] = useState<string | null>(null)
+  const [syncResult, setSyncResult] = useState<{ total: number; created: number; updated: number; skipped: number } | null>(null)
 
   const supabase = createClient()
 
@@ -47,9 +57,27 @@ export default function SettingsPage() {
     fetch('/api/carddav/sync')
       .then((r) => r.json())
       .then((d) => {
-        setIcloudSavedAppleId(d.apple_id ?? null)
-        setIcloudLastSynced(d.last_synced_at ?? null)
-        setSelectedBooks(d.selected_books ?? [])
+        if (d.apple_id) {
+          setIcloudSavedAppleId(d.apple_id)
+          setIcloudLastSynced(d.last_synced_at ?? null)
+          setSelectedBooks(d.selected_books ?? [])
+          setSelectedContacts(d.selected_contacts ?? [])
+          if (d.last_synced_at) {
+            setIcloudPhase('connected')
+          } else {
+            // Has credentials but never synced — go straight to picking
+            setIcloudAppleId(d.apple_id)
+            fetch('/api/carddav/books')
+              .then((r) => r.json())
+              .then((bd) => {
+                if (bd.books) { setBooks(bd.books); setIcloudPhase('picking') }
+                else setIcloudPhase('form')
+              })
+              .catch(() => setIcloudPhase('form'))
+          }
+        } else {
+          setIcloudPhase('form')
+        }
       })
       .catch(() => {})
   }, [])
@@ -64,20 +92,94 @@ export default function SettingsPage() {
     }
   }
 
-  async function handleOpenBookPicker() {
-    setShowBookPicker(true)
-    if (books.length > 0) return
-    setBooksLoading(true)
-    setBooksError('')
-    try {
+  async function handleConnect() {
+    setConnecting(true)
+    setConnectError('')
+    const res = await fetch('/api/carddav/connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apple_id: icloudAppleId, app_password: icloudPassword, save: icloudSave }),
+    })
+    const data = await res.json()
+    setConnecting(false)
+    if (!res.ok) { setConnectError(data.error ?? 'Connection failed'); return }
+    setBooks(data.books ?? [])
+    setIcloudSavedAppleId(icloudAppleId)
+    setIcloudPassword('')
+    setIcloudPhase('picking')
+  }
+
+  async function handleLoadContacts(bookUrl: string) {
+    if (expandedBook === bookUrl) { setExpandedBook(null); return }
+    setExpandedBook(bookUrl)
+    if (bookContacts[bookUrl]) return // already loaded
+    setContactsLoading(true)
+    const res = await fetch('/api/carddav/preview', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ book_url: bookUrl }),
+    })
+    const data = await res.json()
+    if (res.ok) setBookContacts((prev) => ({ ...prev, [bookUrl]: data.contacts ?? [] }))
+    setContactsLoading(false)
+  }
+
+  async function handleSync() {
+    setSyncing(true)
+    setSyncError('')
+    const body: Record<string, unknown> = {}
+    if (syncMode === 'lists') {
+      body.selected_books = selectedBooks
+    } else if (syncMode === 'contacts') {
+      body.selected_books = []
+      body.selected_contacts = selectedContacts
+    } else {
+      // 'all' — send empty arrays to sync everything
+      body.selected_books = []
+      body.selected_contacts = []
+    }
+
+    const res = await fetch('/api/carddav/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const data = await res.json()
+    setSyncing(false)
+    if (!res.ok) { setSyncError(data.error ?? 'Sync failed'); return }
+    setSyncResult(data)
+    setIcloudLastSynced(new Date().toISOString())
+    setIcloudPhase('connected')
+  }
+
+  async function handleDisconnect() {
+    await fetch('/api/carddav/sync', { method: 'DELETE' })
+    setIcloudSavedAppleId(null)
+    setIcloudLastSynced(null)
+    setSyncResult(null)
+    setIcloudAppleId(isAppleUser && user?.email ? user.email : '')
+    setIcloudPassword('')
+    setBooks([])
+    setSelectedBooks([])
+    setSelectedContacts([])
+    setExpandedBook(null)
+    setBookContacts({})
+    setIcloudPhase('form')
+  }
+
+  async function handleChangeSelection() {
+    setSyncError('')
+    if (books.length === 0) {
       const res = await fetch('/api/carddav/books')
       const data = await res.json()
-      if (!res.ok) setBooksError(data.error ?? 'Failed to load lists')
-      else setBooks(data.books ?? [])
-    } catch {
-      setBooksError('Network error')
+      if (data.books) setBooks(data.books)
     }
-    setBooksLoading(false)
+    setIcloudPhase('picking')
+  }
+
+  async function handleSignOut() {
+    await supabase.auth.signOut()
+    window.location.href = '/login'
   }
 
   function toggleBook(url: string) {
@@ -86,77 +188,24 @@ export default function SettingsPage() {
     )
   }
 
-  async function handleSaveBooks() {
-    setIcloudSyncing(true)
-    setIcloudError('')
-    setIcloudResult(null)
-    setShowBookPicker(false)
-    try {
-      const res = await fetch('/api/carddav/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ selected_books: selectedBooks }),
-      })
-      const data = await res.json()
-      if (!res.ok) setIcloudError(data.error ?? 'Sync failed')
-      else { setIcloudResult(data); setIcloudLastSynced(new Date().toISOString()) }
-    } catch {
-      setIcloudError('Network error')
-    }
-    setIcloudSyncing(false)
-  }
-
-  async function handleIcloudSync() {
-    setIcloudSyncing(true)
-    setIcloudError('')
-    setIcloudResult(null)
-    try {
-      const body: Record<string, unknown> = { save: icloudSave }
-      if (!icloudSavedAppleId || showIcloudForm) {
-        body.apple_id = icloudAppleId
-        body.app_password = icloudPassword
-      }
-      const res = await fetch('/api/carddav/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      const data = await res.json()
-      if (!res.ok) {
-        setIcloudError(data.error ?? 'Sync failed')
-      } else {
-        setIcloudResult(data)
-        setIcloudLastSynced(new Date().toISOString())
-        if (icloudSave && icloudAppleId) {
-          setIcloudSavedAppleId(icloudAppleId)
-          setShowIcloudForm(false)
-          setIcloudPassword('')
-        }
-      }
-    } catch {
-      setIcloudError('Network error — please try again')
-    }
-    setIcloudSyncing(false)
-  }
-
-  async function handleIcloudDisconnect() {
-    await fetch('/api/carddav/sync', { method: 'DELETE' })
-    setIcloudSavedAppleId(null)
-    setIcloudLastSynced(null)
-    setIcloudResult(null)
-    setIcloudPassword('')
-    setShowIcloudForm(false)
-    // Re-fill Apple ID for Apple users so reconnecting is easy
-    if (isAppleUser && user?.email) setIcloudAppleId(user.email)
-    else setIcloudAppleId('')
-  }
-
-  async function handleSignOut() {
-    await supabase.auth.signOut()
-    window.location.href = '/login'
+  function toggleContact(uid: string) {
+    setSelectedContacts((prev) =>
+      prev.includes(uid) ? prev.filter((u) => u !== uid) : [...prev, uid],
+    )
   }
 
   const providerLabel = isAppleUser ? 'Apple' : user?.app_metadata?.provider === 'google' ? 'Google' : 'Email'
+
+  // Summary text for picking / connected phase
+  function selectionSummary() {
+    if (syncMode === 'all') return 'All contacts'
+    if (syncMode === 'lists') {
+      if (selectedBooks.length === 0) return 'No lists selected'
+      return `${selectedBooks.length} list${selectedBooks.length !== 1 ? 's' : ''} selected`
+    }
+    if (selectedContacts.length === 0) return 'No contacts selected'
+    return `${selectedContacts.length} contact${selectedContacts.length !== 1 ? 's' : ''} selected`
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -165,7 +214,7 @@ export default function SettingsPage() {
         <div className="space-y-4">
 
           {/* iCloud callout for Apple users who haven't connected yet */}
-          {isAppleUser && !icloudSavedAppleId && (
+          {isAppleUser && !icloudSavedAppleId && icloudPhase === 'form' && (
             <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 flex gap-3">
               <Cloud className="w-5 h-5 text-blue-500 shrink-0 mt-0.5" />
               <div>
@@ -199,109 +248,14 @@ export default function SettingsPage() {
           </div>
 
           {/* iCloud Contacts */}
-          <div className={`bg-white rounded-xl border p-5 ${isAppleUser && !icloudSavedAppleId ? 'border-blue-300' : 'border-gray-200'}`}>
+          <div className={`bg-white rounded-xl border p-5 ${isAppleUser && icloudPhase === 'form' ? 'border-blue-300' : 'border-gray-200'}`}>
             <div className="flex items-center gap-2 mb-4">
-              <Cloud className={`w-4 h-4 ${isAppleUser && !icloudSavedAppleId ? 'text-blue-500' : 'text-gray-400'}`} />
+              <Cloud className={`w-4 h-4 ${isAppleUser && icloudPhase === 'form' ? 'text-blue-500' : 'text-gray-400'}`} />
               <h2 className="text-sm font-semibold text-gray-900">iCloud Contacts</h2>
             </div>
 
-            {icloudSavedAppleId && !showIcloudForm ? (
-              <div className="space-y-3">
-                <div className="flex items-start justify-between">
-                  <div>
-                    <label className="text-xs text-gray-500">Connected as</label>
-                    <p className="text-sm font-medium text-gray-900 mt-0.5">{icloudSavedAppleId}</p>
-                  </div>
-                  {icloudLastSynced && (
-                    <div className="text-right">
-                      <label className="text-xs text-gray-500">Last synced</label>
-                      <p className="text-xs text-gray-600 mt-0.5">{new Date(icloudLastSynced).toLocaleString()}</p>
-                    </div>
-                  )}
-                </div>
-
-                {/* Book picker */}
-                <div className="border border-gray-200 rounded-lg overflow-hidden">
-                  <button
-                    onClick={showBookPicker ? () => setShowBookPicker(false) : handleOpenBookPicker}
-                    className="w-full flex items-center justify-between px-3 py-2.5 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
-                  >
-                    <span className="flex items-center gap-2">
-                      <List className="w-3.5 h-3.5 text-gray-400" />
-                      {selectedBooks.length === 0
-                        ? 'All lists'
-                        : `${selectedBooks.length} list${selectedBooks.length !== 1 ? 's' : ''} selected`}
-                    </span>
-                    {showBookPicker ? <ChevronUp className="w-3.5 h-3.5 text-gray-400" /> : <ChevronDown className="w-3.5 h-3.5 text-gray-400" />}
-                  </button>
-
-                  {showBookPicker && (
-                    <div className="border-t border-gray-200 bg-gray-50 p-3 space-y-2">
-                      {booksLoading ? (
-                        <p className="text-xs text-gray-400 py-1">Loading lists...</p>
-                      ) : booksError ? (
-                        <p className="text-xs text-red-600">{booksError}</p>
-                      ) : (
-                        <>
-                          <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer hover:text-gray-900">
-                            <input
-                              type="checkbox"
-                              checked={selectedBooks.length === 0}
-                              onChange={() => setSelectedBooks([])}
-                              className="rounded"
-                            />
-                            <span className="font-medium">All lists</span>
-                          </label>
-                          <div className="border-t border-gray-200 pt-2 space-y-1.5">
-                            {books.map((book) => (
-                              <label key={book.url} className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer hover:text-gray-900">
-                                <input
-                                  type="checkbox"
-                                  checked={selectedBooks.includes(book.url)}
-                                  onChange={() => toggleBook(book.url)}
-                                  className="rounded"
-                                />
-                                {book.name}
-                              </label>
-                            ))}
-                          </div>
-                          <div className="flex gap-2 pt-1 border-t border-gray-200">
-                            <Button size="sm" onClick={handleSaveBooks} loading={icloudSyncing}>
-                              <RefreshCw className="w-3 h-3" />
-                              Save & sync
-                            </Button>
-                            <Button variant="outline" size="sm" onClick={() => setShowBookPicker(false)}>
-                              Cancel
-                            </Button>
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {icloudResult && (
-                  <div className="bg-green-50 rounded-lg p-3 text-xs text-green-700">
-                    Synced {icloudResult.total} contacts — {icloudResult.created} added, {icloudResult.updated} updated
-                    {icloudResult.skipped > 0 && `, ${icloudResult.skipped} skipped`}
-                  </div>
-                )}
-                {icloudError && <p className="text-xs text-red-600">{icloudError}</p>}
-                <div className="flex items-center gap-2 pt-1">
-                  <Button size="sm" onClick={handleIcloudSync} loading={icloudSyncing}>
-                    <RefreshCw className="w-3.5 h-3.5" />
-                    Sync now
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={() => setShowIcloudForm(true)}>
-                    Update password
-                  </Button>
-                  <Button variant="ghost" size="sm" onClick={handleIcloudDisconnect}>
-                    <Unlink className="w-3.5 h-3.5" />
-                    Disconnect
-                  </Button>
-                </div>
-              </div>
-            ) : (
+            {/* ── FORM PHASE ── */}
+            {icloudPhase === 'form' && (
               <div className="space-y-3">
                 {isAppleUser ? (
                   <p className="text-sm text-gray-500">
@@ -320,8 +274,8 @@ export default function SettingsPage() {
                     value={icloudAppleId}
                     onChange={(e) => setIcloudAppleId(e.target.value)}
                     placeholder="you@icloud.com"
-                    readOnly={isAppleUser && !showIcloudForm}
-                    className={`w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${isAppleUser && !showIcloudForm ? 'bg-gray-50 text-gray-500' : ''}`}
+                    readOnly={isAppleUser}
+                    className={`w-full border border-gray-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 ${isAppleUser ? 'bg-gray-50 text-gray-500' : ''}`}
                   />
                 </div>
                 <div>
@@ -351,23 +305,238 @@ export default function SettingsPage() {
                   Remember credentials
                 </label>
 
-                {icloudError && <p className="text-xs text-red-600">{icloudError}</p>}
+                {connectError && <p className="text-xs text-red-600">{connectError}</p>}
 
                 <div className="flex items-center gap-2 pt-1">
                   <Button
                     size="sm"
-                    onClick={handleIcloudSync}
-                    loading={icloudSyncing}
+                    onClick={handleConnect}
+                    loading={connecting}
                     disabled={!icloudAppleId || !icloudPassword}
                   >
-                    <RefreshCw className="w-3.5 h-3.5" />
-                    {icloudSavedAppleId ? 'Save & sync' : 'Connect & sync'}
+                    <Cloud className="w-3.5 h-3.5" />
+                    Connect
                   </Button>
-                  {showIcloudForm && (
-                    <Button variant="outline" size="sm" onClick={() => { setShowIcloudForm(false); setIcloudPassword('') }}>
+                </div>
+              </div>
+            )}
+
+            {/* ── PICKING PHASE ── */}
+            {icloudPhase === 'picking' && (
+              <div className="space-y-4">
+                {/* Connected header */}
+                <div className="flex items-center gap-2 text-sm text-green-700 bg-green-50 rounded-lg px-3 py-2">
+                  <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  <span>Connected as <span className="font-medium">{icloudSavedAppleId}</span></span>
+                </div>
+
+                <div>
+                  <p className="text-sm font-medium text-gray-800 mb-2">Choose what to sync</p>
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="syncMode"
+                        checked={syncMode === 'all'}
+                        onChange={() => setSyncMode('all')}
+                      />
+                      All contacts
+                    </label>
+                    <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="syncMode"
+                        checked={syncMode === 'lists'}
+                        onChange={() => setSyncMode('lists')}
+                      />
+                      Specific lists
+                    </label>
+                    <label className="flex items-center gap-2 text-sm text-gray-700 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="syncMode"
+                        checked={syncMode === 'contacts'}
+                        onChange={() => setSyncMode('contacts')}
+                      />
+                      Specific contacts
+                    </label>
+                  </div>
+                </div>
+
+                {/* Lists mode: checkboxes per book with Browse button */}
+                {syncMode === 'lists' && books.length > 0 && (
+                  <div className="border border-gray-200 rounded-lg overflow-hidden">
+                    {books.map((book, i) => (
+                      <div key={book.url} className={i > 0 ? 'border-t border-gray-100' : ''}>
+                        <div className="flex items-center gap-2 px-3 py-2.5">
+                          <input
+                            type="checkbox"
+                            id={`book-list-${book.url}`}
+                            checked={selectedBooks.includes(book.url)}
+                            onChange={() => toggleBook(book.url)}
+                            className="rounded shrink-0"
+                          />
+                          <label htmlFor={`book-list-${book.url}`} className="flex-1 text-sm text-gray-700 cursor-pointer">
+                            {book.name}
+                          </label>
+                          <button
+                            onClick={() => handleLoadContacts(book.url)}
+                            className="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1 shrink-0"
+                          >
+                            <List className="w-3 h-3" />
+                            Browse
+                            {expandedBook === book.url
+                              ? <ChevronUp className="w-3 h-3" />
+                              : <ChevronDown className="w-3 h-3" />
+                            }
+                          </button>
+                        </div>
+                        {expandedBook === book.url && (
+                          <div className="border-t border-gray-100 bg-gray-50 px-4 py-2 space-y-1 max-h-48 overflow-y-auto">
+                            {contactsLoading && !bookContacts[book.url] ? (
+                              <p className="text-xs text-gray-400 py-1">Loading contacts...</p>
+                            ) : (bookContacts[book.url] ?? []).length === 0 ? (
+                              <p className="text-xs text-gray-400 py-1">No contacts found</p>
+                            ) : (
+                              (bookContacts[book.url] ?? []).map((c) => (
+                                <div key={c.uid} className="text-xs text-gray-600 py-0.5">
+                                  <span className="font-medium">{c.name}</span>
+                                  {c.email && <span className="text-gray-400 ml-1">· {c.email}</span>}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Contacts mode: expandable books with contact checkboxes */}
+                {syncMode === 'contacts' && books.length > 0 && (
+                  <div className="border border-gray-200 rounded-lg overflow-hidden">
+                    {books.map((book, i) => (
+                      <div key={book.url} className={i > 0 ? 'border-t border-gray-100' : ''}>
+                        <button
+                          onClick={() => handleLoadContacts(book.url)}
+                          className="w-full flex items-center justify-between px-3 py-2.5 text-sm text-gray-700 hover:bg-gray-50 transition-colors"
+                        >
+                          <span>{book.name}</span>
+                          {expandedBook === book.url
+                            ? <ChevronUp className="w-3.5 h-3.5 text-gray-400" />
+                            : <ChevronDown className="w-3.5 h-3.5 text-gray-400" />
+                          }
+                        </button>
+                        {expandedBook === book.url && (
+                          <div className="border-t border-gray-100 bg-gray-50 px-3 py-2 space-y-1.5 max-h-64 overflow-y-auto">
+                            {contactsLoading && !bookContacts[book.url] ? (
+                              <p className="text-xs text-gray-400 py-1">Loading contacts...</p>
+                            ) : (bookContacts[book.url] ?? []).length === 0 ? (
+                              <p className="text-xs text-gray-400 py-1">No contacts found</p>
+                            ) : (
+                              (bookContacts[book.url] ?? []).map((c) => (
+                                <label key={c.uid} className="flex items-start gap-2 text-sm text-gray-700 cursor-pointer hover:text-gray-900">
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedContacts.includes(c.uid)}
+                                    onChange={() => toggleContact(c.uid)}
+                                    className="rounded mt-0.5 shrink-0"
+                                  />
+                                  <span>
+                                    <span className="font-medium">{c.name}</span>
+                                    {c.email && <span className="block text-xs text-gray-400">{c.email}</span>}
+                                  </span>
+                                </label>
+                              ))
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Summary */}
+                <p className="text-xs text-gray-500">
+                  Will sync: <span className="font-medium text-gray-700">{selectionSummary()}</span>
+                </p>
+
+                {syncError && <p className="text-xs text-red-600">{syncError}</p>}
+
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    onClick={handleSync}
+                    loading={syncing}
+                    disabled={
+                      (syncMode === 'lists' && selectedBooks.length === 0) ||
+                      (syncMode === 'contacts' && selectedContacts.length === 0)
+                    }
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Sync selected
+                  </Button>
+                  {icloudLastSynced && (
+                    <Button variant="outline" size="sm" onClick={() => setIcloudPhase('connected')}>
                       Cancel
                     </Button>
                   )}
+                </div>
+              </div>
+            )}
+
+            {/* ── CONNECTED PHASE ── */}
+            {icloudPhase === 'connected' && (
+              <div className="space-y-3">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <label className="text-xs text-gray-500">Connected as</label>
+                    <p className="text-sm font-medium text-gray-900 mt-0.5">{icloudSavedAppleId}</p>
+                  </div>
+                  {icloudLastSynced && (
+                    <div className="text-right">
+                      <label className="text-xs text-gray-500">Last synced</label>
+                      <p className="text-xs text-gray-600 mt-0.5">{new Date(icloudLastSynced).toLocaleString()}</p>
+                    </div>
+                  )}
+                </div>
+
+                <div className="text-xs text-gray-500">
+                  Syncing:{' '}
+                  <span className="font-medium text-gray-700">
+                    {selectedContacts.length > 0
+                      ? `${selectedContacts.length} specific contact${selectedContacts.length !== 1 ? 's' : ''}`
+                      : selectedBooks.length > 0
+                        ? `${selectedBooks.length} list${selectedBooks.length !== 1 ? 's' : ''}`
+                        : 'All contacts'}
+                  </span>
+                </div>
+
+                {syncResult && (
+                  <div className="bg-green-50 rounded-lg p-3 text-xs text-green-700">
+                    Synced {syncResult.total} contacts — {syncResult.created} added, {syncResult.updated} updated
+                    {syncResult.skipped > 0 && `, ${syncResult.skipped} skipped`}
+                  </div>
+                )}
+
+                {syncError && <p className="text-xs text-red-600">{syncError}</p>}
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <Button size="sm" onClick={handleSync} loading={syncing}>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Sync now
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={handleChangeSelection}>
+                    <List className="w-3.5 h-3.5" />
+                    Change selection
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => { setConnectError(''); setIcloudPhase('form') }}>
+                    Update password
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={handleDisconnect}>
+                    <Unlink className="w-3.5 h-3.5" />
+                    Disconnect
+                  </Button>
                 </div>
               </div>
             )}
