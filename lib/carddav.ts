@@ -12,6 +12,13 @@ function basicAuth(appleId: string, appPassword: string): string {
   return 'Basic ' + Buffer.from(`${appleId}:${appPassword}`).toString('base64')
 }
 
+const DAV_HEADERS = (auth: string, depth = '0') => ({
+  Authorization: auth,
+  'Content-Type': 'application/xml; charset=utf-8',
+  Depth: depth,
+  'User-Agent': 'VendorTracker/1.0 (CardDAV client)',
+})
+
 // Follow redirects manually so non-GET methods are preserved
 async function davFetch(
   method: string,
@@ -24,11 +31,7 @@ async function davFetch(
   for (let i = 0; i < 6; i++) {
     const res = await fetch(currentUrl, {
       method,
-      headers: {
-        Authorization: auth,
-        'Content-Type': 'application/xml; charset=utf-8',
-        Depth: depth,
-      },
+      headers: DAV_HEADERS(auth, depth),
       body,
       redirect: 'manual',
     })
@@ -39,7 +42,7 @@ async function davFetch(
       continue
     }
     if (res.status === 401) {
-      throw new Error('Invalid Apple ID or app-specific password (401 Unauthorized)')
+      throw new Error('Invalid Apple ID or app-specific password')
     }
     if (res.status !== 207 && !res.ok) {
       const text = await res.text()
@@ -72,43 +75,65 @@ function xmlResponses(xml: string): string[] {
   return results
 }
 
+const PROPFIND_HOME_BODY = `<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:prop><D:current-user-principal/><C:addressbook-home-set/></D:prop></D:propfind>`
+const PROPFIND_HOME_SET_BODY = `<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:prop><C:addressbook-home-set/></D:prop></D:propfind>`
+
+function toAbsolute(href: string): string {
+  return href.startsWith('http') ? href : `https://contacts.icloud.com${href}`
+}
+
 async function resolveAddressBookHome(auth: string): Promise<string> {
-  // iCloud's well-known endpoint redirects (via GET) to the user-specific CardDAV root.
-  // We use GET + redirect:follow so fetch resolves the final URL automatically.
-  const getRes = await fetch('https://contacts.icloud.com/.well-known/carddav', {
-    method: 'GET',
-    headers: { Authorization: auth },
-    redirect: 'follow',
-  })
+  // iCloud requires auth before it will redirect. We try several discovery
+  // strategies in sequence, stopping at the first that succeeds.
 
-  if (getRes.status === 401) {
-    throw new Error('Invalid Apple ID or app-specific password (401 Unauthorized)')
+  const candidates = [
+    'https://contacts.icloud.com/',
+    'https://contacts.icloud.com/.well-known/carddav',
+  ]
+
+  for (const url of candidates) {
+    const res = await fetch(url, {
+      method: 'PROPFIND',
+      headers: DAV_HEADERS(auth),
+      body: PROPFIND_HOME_BODY,
+      redirect: 'manual',
+    })
+
+    if (res.status === 401) {
+      throw new Error('Invalid Apple ID or app-specific password')
+    }
+
+    // Redirect → the Location IS the user's carddav root
+    if (res.status === 301 || res.status === 302 || res.status === 307 || res.status === 308) {
+      const loc = res.headers.get('location')
+      if (loc) return toAbsolute(loc)
+    }
+
+    if (res.status === 207) {
+      const xml = await res.text()
+
+      // Direct addressbook-home-set
+      const homeTag = xmlTag(xml, 'addressbook-home-set')
+      const homeHref = homeTag ? xmlHref(homeTag) : null
+      if (homeHref) return toAbsolute(homeHref)
+
+      // current-user-principal → then ask it for addressbook-home-set
+      const principalTag = xmlTag(xml, 'current-user-principal')
+      const principalHref = principalTag ? xmlHref(principalTag) : null
+      if (principalHref) {
+        const xml2 = await davFetch('PROPFIND', toAbsolute(principalHref), auth, PROPFIND_HOME_SET_BODY)
+        const homeTag2 = xmlTag(xml2, 'addressbook-home-set')
+        const homeHref2 = homeTag2 ? xmlHref(homeTag2) : null
+        if (homeHref2) return toAbsolute(homeHref2)
+      }
+    }
   }
 
-  // The final URL after redirects is the user's CardDAV root
-  // e.g. https://contacts.icloud.com/1234567890/carddav/
-  const rootUrl = getRes.url
-
-  if (!rootUrl || rootUrl.includes('.well-known')) {
-    throw new Error(
-      `iCloud CardDAV: discovery redirect failed — ended up at ${rootUrl}. Check your Apple ID and app-specific password.`,
-    )
-  }
-
-  // Ask this root for the addressbook-home-set
-  const xml = await davFetch(
-    'PROPFIND',
-    rootUrl,
-    auth,
-    `<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:prop><C:addressbook-home-set/></D:prop></D:propfind>`,
+  throw new Error(
+    'iCloud CardDAV: could not discover contacts URL. ' +
+    'Make sure your Apple ID is correct and that iCloud Contacts is enabled on your account. ' +
+    'The app-specific password must be generated at appleid.apple.com (format: xxxx-xxxx-xxxx-xxxx).',
   )
-  const homeTag = xmlTag(xml, 'addressbook-home-set')
-  const homeHref = homeTag ? xmlHref(homeTag) : null
-
-  // Fall back to rootUrl itself if addressbook-home-set isn't exposed
-  if (!homeHref) return rootUrl
-
-  return homeHref.startsWith('http') ? homeHref : `https://contacts.icloud.com${homeHref}`
 }
 
 async function listAddressBooks(homeUrl: string, auth: string): Promise<string[]> {
