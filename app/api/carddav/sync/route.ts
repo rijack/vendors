@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { fetchiCloudContacts } from '@/lib/carddav'
+import { fetchiCloudContacts, fetchGroups } from '@/lib/carddav'
 
 export const maxDuration = 60 // seconds (Vercel hobby: 60s max)
 
@@ -31,7 +31,7 @@ export async function GET() {
 }
 
 // POST — sync iCloud contacts
-// Body: { apple_id?, app_password?, save?: boolean, selected_books?: string[], selected_contacts?: string[] }
+// Body: { apple_id?, app_password?, save?: boolean, selected_books?: string[], selected_contacts?: string[], selected_groups?: string[] }
 export async function POST(req: Request) {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
@@ -43,6 +43,8 @@ export async function POST(req: Request) {
   const save: boolean = body.save ?? false
   const selectedBooks: string[] | undefined = body.selected_books
   const selectedContacts: string[] | undefined = body.selected_contacts
+  // selected_groups: group UIDs to save for UI restoration (stored in icloud_selected_books)
+  const selectedGroups: string[] | undefined = body.selected_groups
 
   // Load saved settings
   const { data: settings } = await supabase
@@ -60,43 +62,77 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'No iCloud credentials provided or saved' }, { status: 400 })
   }
 
-  // Determine which books to sync: use body value if provided, else use saved
-  const booksToSync: string[] =
+  // Determine which books to sync: use body value if provided, else use saved.
+  // icloud_selected_books may contain group UIDs (non-URLs) for UI restoration — ignore those.
+  const rawBooks: string[] =
     selectedBooks !== undefined
       ? selectedBooks
       : (((settings as any)?.icloud_selected_books as string[] | null) ?? [])
+  const booksToSync = rawBooks.filter((v) => v.startsWith('http'))
 
-  // Determine which contact UIDs to filter: use body value if provided, else use saved
-  const uidsToFilter: string[] =
+  // Group UIDs saved for "Specific lists" mode (non-URL entries in icloud_selected_books)
+  const savedGroupUids = rawBooks.filter((v) => !v.startsWith('http'))
+
+  // Determine which contact UIDs to filter: use body value if provided, else use saved.
+  // If groups are saved, re-resolve their membership live so newly added contacts are picked up.
+  let uidsToFilter: string[] =
     selectedContacts !== undefined
       ? selectedContacts
       : (((settings as any)?.icloud_selected_contacts as string[] | null) ?? [])
 
+  if (selectedContacts === undefined && savedGroupUids.length > 0) {
+    // Re-fetch group membership fresh from iCloud
+    try {
+      const liveGroups = await fetchGroups(appleId, appPassword)
+      const memberUids = liveGroups
+        .filter((g) => savedGroupUids.includes(g.uid))
+        .flatMap((g) => g.memberUids)
+      if (memberUids.length > 0) {
+        uidsToFilter = [...new Set(memberUids)]
+        // Persist updated membership so manual sync stays in sync too
+        await supabase
+          .from('user_settings')
+          .upsert({ user_id: user.id, icloud_selected_contacts: uidsToFilter }, { onConflict: 'user_id' })
+      }
+    } catch {
+      // Fall back to saved UIDs if group re-fetch fails
+    }
+  }
+
   // Fetch from iCloud
-  let icloudContacts
+  let icloudContacts: Awaited<ReturnType<typeof fetchiCloudContacts>>['contacts'] = []
+  let primaryBookUrl: string | null = null
   try {
-    icloudContacts = await fetchiCloudContacts(
+    const result = await fetchiCloudContacts(
       appleId,
       appPassword,
       booksToSync.length > 0 ? booksToSync : undefined,
       uidsToFilter.length > 0 ? uidsToFilter : undefined,
     )
+    icloudContacts = result.contacts
+    primaryBookUrl = result.primaryBookUrl
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error'
     return NextResponse.json({ error: message }, { status: 400 })
   }
 
-  // Persist credentials and/or selections
+  // Persist credentials, selections, and discovered book URL
   const upsertData: Record<string, unknown> = { user_id: user.id }
   if (save) {
     upsertData.icloud_apple_id = appleId
     upsertData.icloud_app_password = appPassword
   }
-  if (selectedBooks !== undefined) {
+  if (selectedGroups !== undefined) {
+    upsertData.icloud_selected_books = selectedGroups
+  } else if (selectedBooks !== undefined) {
     upsertData.icloud_selected_books = selectedBooks
   }
   if (selectedContacts !== undefined) {
     upsertData.icloud_selected_contacts = selectedContacts
+  }
+  // Always save the discovered book URL for outbound sync
+  if (primaryBookUrl) {
+    upsertData.icloud_book_url = primaryBookUrl
   }
   if (Object.keys(upsertData).length > 1) {
     await supabase.from('user_settings').upsert(upsertData, { onConflict: 'user_id' })
@@ -110,6 +146,7 @@ export async function POST(req: Request) {
   const byUid = new Map((existing ?? []).map((c) => [c.macos_contact_id, c.id]))
 
   let created = 0, updated = 0, skipped = 0
+  const errors: string[] = []
   for (const c of icloudContacts) {
     const existingId = byUid.get(c.uid)
     const row = {
@@ -122,11 +159,11 @@ export async function POST(req: Request) {
       macos_contact_id: c.uid,
     }
     if (existingId) {
-      const { error } = await supabase.from('contacts').update(row).eq('id', existingId)
-      if (error) skipped++; else updated++
+      const { error } = await supabase.from('contacts').update(row).eq('id', existingId).eq('user_id', user.id)
+      if (error) { skipped++; errors.push(`update ${c.name}: ${error.message}`) } else updated++
     } else {
       const { error } = await supabase.from('contacts').insert({ ...row, user_id: user.id })
-      if (error) skipped++; else created++
+      if (error) { skipped++; errors.push(`insert ${c.name}: ${error.message}`) } else created++
     }
   }
 
@@ -135,7 +172,7 @@ export async function POST(req: Request) {
     { onConflict: 'user_id' },
   )
 
-  return NextResponse.json({ total: icloudContacts.length, created, updated, skipped })
+  return NextResponse.json({ total: icloudContacts.length, created, updated, skipped, errors })
 }
 
 // DELETE — remove saved iCloud credentials and selection
@@ -151,6 +188,7 @@ export async function DELETE() {
       icloud_app_password: null,
       icloud_selected_books: [],
       icloud_selected_contacts: [],
+      icloud_book_url: null,
     })
     .eq('user_id', user.id)
 

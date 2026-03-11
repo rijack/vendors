@@ -1,17 +1,15 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
-import { Plus, Users, Filter, Upload } from 'lucide-react'
+import { useState, useEffect, useCallback, useRef } from 'react'
+import { Plus, Users, Filter, RefreshCw, ChevronUp, ChevronDown, ChevronsUpDown, Trash2, Mail, Phone } from 'lucide-react'
 import { createClient } from '@/lib/supabase/client'
-import { ContactCard } from '@/components/contacts/ContactCard'
 import { ContactForm } from '@/components/contacts/ContactForm'
-import { VCardImportModal } from '@/components/contacts/VCardImportModal'
 import { PageHeader } from '@/components/ui/PageHeader'
 import { Button } from '@/components/ui/Button'
 import { SearchInput } from '@/components/ui/SearchInput'
-import { Select } from '@/components/ui/Select'
 import { EmptyState } from '@/components/ui/EmptyState'
 import { Modal } from '@/components/ui/Modal'
+import { Toast, type ToastMessage } from '@/components/ui/Toast'
 import { CONTACT_CATEGORIES } from '@/lib/constants'
 import type { Contact } from '@/types'
 
@@ -25,7 +23,24 @@ export default function ContactsPage() {
   const [deleteContact, setDeleteContact] = useState<Contact | null>(null)
   const [saving, setSaving] = useState(false)
   const [deleting, setDeleting] = useState(false)
-  const [importOpen, setImportOpen] = useState(false)
+  const [sortKey, setSortKey] = useState<'name' | 'company' | 'role' | 'email' | 'phone'>('name')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
+
+  // iCloud sync state
+  const [icloudConnected, setIcloudConnected] = useState(false)
+  const [icloudSyncing, setIcloudSyncing] = useState(false)
+  const icloudChecked = useRef(false)
+
+  // Toast notifications
+  const [toasts, setToasts] = useState<ToastMessage[]>([])
+  const toastId = useRef(0)
+  function addToast(type: ToastMessage['type'], message: string) {
+    const id = ++toastId.current
+    setToasts((prev) => [...prev, { id, type, message }])
+  }
+  function dismissToast(id: number) {
+    setToasts((prev) => prev.filter((t) => t.id !== id))
+  }
 
   const supabase = createClient()
 
@@ -54,9 +69,86 @@ export default function ContactsPage() {
     fetchContacts()
   }, [fetchContacts])
 
+  // Sync on mount
+  useEffect(() => {
+    if (icloudChecked.current) return
+    icloudChecked.current = true
+
+    fetch('/api/carddav/sync')
+      .then((r) => r.json())
+      .then((d) => {
+        if (!d.apple_id) return
+        setIcloudConnected(true)
+        setIcloudSyncing(true)
+        fetch('/api/carddav/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        })
+          .then((r) => r.json())
+          .then(() => fetchContacts())
+          .catch(() => {})
+          .finally(() => setIcloudSyncing(false))
+      })
+      .catch(() => {})
+  }, [fetchContacts])
+
+  // Manually pull latest contacts from iCloud
+  async function syncFromiCloud() {
+    if (!icloudConnected) return
+    setIcloudSyncing(true)
+    try {
+      const res = await fetch('/api/carddav/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const result = await res.json()
+      if (!res.ok) {
+        addToast('error', `iCloud sync failed: ${result.error ?? 'Unknown error'}`)
+      } else {
+        fetchContacts()
+        addToast('success', `Synced — ${result.updated} updated, ${result.created} added`)
+      }
+    } catch {
+      addToast('error', 'iCloud sync failed: network error')
+    } finally {
+      setIcloudSyncing(false)
+    }
+  }
+
+  // Push a contact to iCloud after create/update
+  function pushToiCloud(contactId: string) {
+    if (!icloudConnected) return
+    fetch('/api/carddav/push', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contact_id: contactId }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.error) addToast('error', `iCloud sync failed: ${d.error}`)
+        else if (!d.skipped) addToast('success', 'Synced to iCloud')
+      })
+      .catch(() => addToast('error', 'iCloud sync failed: network error'))
+  }
+
+  // Delete a contact from iCloud
+  function deleteFromiCloud(macosContactId: string | null) {
+    if (!icloudConnected || !macosContactId) return
+    fetch('/api/carddav/push', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ macos_contact_id: macosContactId }),
+    })
+      .then((r) => r.json())
+      .then((d) => { if (d.error) addToast('error', `iCloud delete failed: ${d.error}`) })
+      .catch(() => addToast('error', 'iCloud delete failed: network error'))
+  }
+
   async function handleCreate(values: { name: string; company?: string; category?: string; role?: string; location?: string; phone?: string; email?: string }) {
     setSaving(true)
-    await supabase.from('contacts').insert({
+    const { data: inserted } = await supabase.from('contacts').insert({
       name: values.name,
       company: values.company || null,
       category: values.category || null,
@@ -64,10 +156,11 @@ export default function ContactsPage() {
       location: values.location || null,
       phone: values.phone || null,
       email: values.email || null,
-    })
+    }).select().single()
     setSaving(false)
     setFormOpen(false)
     fetchContacts()
+    if (inserted?.id) pushToiCloud(inserted.id)
   }
 
   async function handleUpdate(values: { name: string; company?: string; category?: string; role?: string; location?: string; phone?: string; email?: string }) {
@@ -88,52 +181,37 @@ export default function ContactsPage() {
     setSaving(false)
     setEditContact(null)
     fetchContacts()
+    pushToiCloud(editContact.id)
   }
 
   async function handleDelete() {
     if (!deleteContact) return
     setDeleting(true)
+    const macosId = deleteContact.macos_contact_id
     await supabase.from('contacts').delete().eq('id', deleteContact.id)
     setDeleting(false)
     setDeleteContact(null)
     fetchContacts()
+    deleteFromiCloud(macosId)
   }
 
-  async function handleVCardImport(contacts: { name: string; company?: string; role?: string; phone?: string; email?: string; location?: string }[]) {
-    // Fetch existing emails/phones to detect duplicates
-    const { data: existing } = await supabase.from('contacts').select('email, phone')
-    const existingEmails = new Set((existing ?? []).map((c) => c.email).filter(Boolean))
-    const existingPhones = new Set((existing ?? []).map((c) => c.phone).filter(Boolean))
 
-    let success = 0
-    let skipped = 0
-    const errors: string[] = []
+  function handleSort(key: typeof sortKey) {
+    if (sortKey === key) setSortDir((d) => d === 'asc' ? 'desc' : 'asc')
+    else { setSortKey(key); setSortDir('asc') }
+  }
 
-    for (const contact of contacts) {
-      // Skip duplicates by email or phone
-      if (contact.email && existingEmails.has(contact.email)) { skipped++; continue }
-      if (contact.phone && existingPhones.has(contact.phone)) { skipped++; continue }
+  const sortedContacts = [...contacts].sort((a, b) => {
+    const av = (a[sortKey] ?? '').toLowerCase()
+    const bv = (b[sortKey] ?? '').toLowerCase()
+    return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av)
+  })
 
-      const { error } = await supabase.from('contacts').insert({
-        name: contact.name,
-        company: contact.company || null,
-        role: contact.role || null,
-        phone: contact.phone || null,
-        email: contact.email || null,
-        location: contact.location || null,
-      })
-
-      if (error) {
-        errors.push(contact.name)
-      } else {
-        success++
-        if (contact.email) existingEmails.add(contact.email)
-        if (contact.phone) existingPhones.add(contact.phone)
-      }
-    }
-
-    if (success > 0) fetchContacts()
-    return { success, skipped, errors }
+  function SortIcon({ col }: { col: typeof sortKey }) {
+    if (sortKey !== col) return <ChevronsUpDown className="w-3.5 h-3.5 text-gray-300" />
+    return sortDir === 'asc'
+      ? <ChevronUp className="w-3.5 h-3.5 text-blue-500" />
+      : <ChevronDown className="w-3.5 h-3.5 text-blue-500" />
   }
 
   const categoryOptions = [
@@ -142,17 +220,24 @@ export default function ContactsPage() {
   ]
 
   return (
+    <>
     <div className="flex flex-col h-full">
       <PageHeader
         title="Contacts"
-        description={`${contacts.length} contact${contacts.length !== 1 ? 's' : ''}`}
+        description={
+          icloudSyncing
+            ? 'Syncing with iCloud...'
+            : `${contacts.length} contact${contacts.length !== 1 ? 's' : ''}`
+        }
         actions={
           <div className="flex items-center gap-2">
-            <Button variant="outline" onClick={() => setImportOpen(true)}>
-              <Upload className="w-4 h-4" />
-              Import
-            </Button>
-            <Button onClick={() => setFormOpen(true)}>
+            {icloudConnected && (
+              <Button variant="outline" onClick={syncFromiCloud} loading={icloudSyncing}>
+                <RefreshCw className="w-4 h-4" />
+                Sync
+              </Button>
+            )}
+<Button onClick={() => setFormOpen(true)}>
               <Plus className="w-4 h-4" />
               Add Contact
             </Button>
@@ -183,50 +268,85 @@ export default function ContactsPage() {
       </div>
 
       {/* List */}
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto">
         {loading ? (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {Array.from({ length: 6 }).map((_, i) => (
-              <div key={i} className="bg-white rounded-xl border border-gray-200 p-4 animate-pulse">
-                <div className="flex items-start gap-3">
-                  <div className="w-10 h-10 bg-gray-200 rounded-full" />
-                  <div className="flex-1 space-y-2">
-                    <div className="h-4 bg-gray-200 rounded w-32" />
-                    <div className="h-3 bg-gray-200 rounded w-24" />
-                  </div>
-                </div>
+          <div className="divide-y divide-gray-100">
+            {Array.from({ length: 8 }).map((_, i) => (
+              <div key={i} className="flex items-center gap-4 px-6 py-3 animate-pulse">
+                <div className="h-4 bg-gray-200 rounded w-36" />
+                <div className="h-4 bg-gray-200 rounded w-28" />
+                <div className="h-4 bg-gray-200 rounded w-24" />
+                <div className="h-4 bg-gray-200 rounded w-40" />
               </div>
             ))}
           </div>
         ) : contacts.length === 0 ? (
-          <EmptyState
-            icon={<Users className="w-6 h-6" />}
-            title={search || categoryFilter ? 'No contacts found' : 'No contacts yet'}
-            description={
-              search || categoryFilter
-                ? 'Try adjusting your filters'
-                : 'Add your first contact to get started'
-            }
-            action={
-              !search && !categoryFilter ? (
-                <Button onClick={() => setFormOpen(true)}>
-                  <Plus className="w-4 h-4" />
-                  Add Contact
-                </Button>
-              ) : undefined
-            }
-          />
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-            {contacts.map((contact) => (
-              <ContactCard
-                key={contact.id}
-                contact={contact}
-                onEdit={() => setEditContact(contact)}
-                onDelete={() => setDeleteContact(contact)}
-              />
-            ))}
+          <div className="p-6">
+            <EmptyState
+              icon={<Users className="w-6 h-6" />}
+              title={search || categoryFilter ? 'No contacts found' : 'No contacts yet'}
+              description={search || categoryFilter ? 'Try adjusting your filters' : 'Add your first contact to get started'}
+              action={!search && !categoryFilter ? (
+                <Button onClick={() => setFormOpen(true)}><Plus className="w-4 h-4" />Add Contact</Button>
+              ) : undefined}
+            />
           </div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="sticky top-0 bg-gray-50 border-b border-gray-200 z-10">
+              <tr>
+                {([
+                  { key: 'name', label: 'Name' },
+                  { key: 'company', label: 'Company' },
+                  { key: 'role', label: 'Role' },
+                  { key: 'email', label: 'Email' },
+                  { key: 'phone', label: 'Phone' },
+                ] as { key: typeof sortKey; label: string }[]).map(({ key, label }) => (
+                  <th
+                    key={key}
+                    onClick={() => handleSort(key)}
+                    className="px-4 py-2.5 text-left text-xs font-medium text-gray-500 uppercase tracking-wide cursor-pointer select-none hover:text-gray-700"
+                  >
+                    <div className="flex items-center gap-1">
+                      {label}
+                      <SortIcon col={key} />
+                    </div>
+                  </th>
+                ))}
+                <th className="px-4 py-2.5 w-16" />
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100 bg-white">
+              {sortedContacts.map((contact) => (
+                <tr
+                  key={contact.id}
+                  onClick={() => setEditContact(contact)}
+                  className="group hover:bg-gray-50 transition-colors cursor-pointer"
+                >
+                  <td className="px-4 py-3 font-medium text-gray-900 whitespace-nowrap">{contact.name}</td>
+                  <td className="px-4 py-3 text-gray-600 whitespace-nowrap">{contact.company ?? <span className="text-gray-300">—</span>}</td>
+                  <td className="px-4 py-3 text-gray-600 whitespace-nowrap">{contact.role ?? <span className="text-gray-300">—</span>}</td>
+                  <td className="px-4 py-3 text-gray-600">
+                    {contact.email
+                      ? <a href={`mailto:${contact.email}`} onClick={(e) => e.stopPropagation()} className="flex items-center gap-1 hover:text-blue-600"><Mail className="w-3.5 h-3.5 shrink-0" />{contact.email}</a>
+                      : <span className="text-gray-300">—</span>}
+                  </td>
+                  <td className="px-4 py-3 text-gray-600 whitespace-nowrap">
+                    {contact.phone
+                      ? <a href={`tel:${contact.phone}`} onClick={(e) => e.stopPropagation()} className="flex items-center gap-1 hover:text-blue-600"><Phone className="w-3.5 h-3.5 shrink-0" />{contact.phone}</a>
+                      : <span className="text-gray-300">—</span>}
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center justify-end opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button onClick={(e) => { e.stopPropagation(); setDeleteContact(contact) }} className="p-1.5 rounded hover:bg-red-100 text-gray-400 hover:text-red-600">
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </div>
 
@@ -249,12 +369,6 @@ export default function ContactsPage() {
         />
       )}
 
-      {/* vCard import */}
-      <VCardImportModal
-        open={importOpen}
-        onClose={() => setImportOpen(false)}
-        onImport={handleVCardImport}
-      />
 
       {/* Delete confirm */}
       <Modal
@@ -274,5 +388,7 @@ export default function ContactsPage() {
         </p>
       </Modal>
     </div>
+    <Toast toasts={toasts} onDismiss={dismissToast} />
+    </>
   )
 }

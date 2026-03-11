@@ -30,7 +30,12 @@ export async function POST(req: Request) {
 
   if (save) {
     await supabase.from('user_settings').upsert(
-      { user_id: user.id, icloud_apple_id: appleId, icloud_app_password: appPassword },
+      {
+        user_id: user.id,
+        icloud_apple_id: appleId,
+        icloud_app_password: appPassword,
+        icloud_book_url: books[0]?.url ?? null,
+      },
       { onConflict: 'user_id' },
     )
   }

@@ -33,6 +33,11 @@ export default function SettingsPage() {
   const [syncing, setSyncing] = useState(false)
   const [syncError, setSyncError] = useState('')
 
+  // groups state (for "Specific lists" mode)
+  const [groups, setGroups] = useState<{ uid: string; name: string; memberUids: string[] }[]>([])
+  const [selectedGroups, setSelectedGroups] = useState<string[]>([])
+  const [groupsLoading, setGroupsLoading] = useState(false)
+
   // connected state
   const [icloudSavedAppleId, setIcloudSavedAppleId] = useState<string | null>(null)
   const [icloudLastSynced, setIcloudLastSynced] = useState<string | null>(null)
@@ -60,8 +65,17 @@ export default function SettingsPage() {
         if (d.apple_id) {
           setIcloudSavedAppleId(d.apple_id)
           setIcloudLastSynced(d.last_synced_at ?? null)
-          setSelectedBooks(d.selected_books ?? [])
-          setSelectedContacts(d.selected_contacts ?? [])
+          // selected_books stores group UIDs (not book URLs) when in groups mode
+          const savedBooks: string[] = d.selected_books ?? []
+          const savedContacts: string[] = d.selected_contacts ?? []
+          setSelectedContacts(savedContacts)
+          // If saved "books" look like UUIDs (not URLs), restore as selected groups
+          if (savedBooks.length > 0 && !savedBooks[0].startsWith('http')) {
+            setSelectedGroups(savedBooks)
+            if (savedContacts.length > 0) setSyncMode('lists')
+          } else {
+            setSelectedBooks(savedBooks)
+          }
           if (d.last_synced_at) {
             setIcloudPhase('connected')
           } else {
@@ -81,6 +95,15 @@ export default function SettingsPage() {
       })
       .catch(() => {})
   }, [])
+
+  useEffect(() => {
+    if (syncMode !== 'lists' || groups.length > 0 || groupsLoading || icloudPhase !== 'picking') return
+    setGroupsLoading(true)
+    fetch('/api/carddav/groups')
+      .then((r) => r.json())
+      .then((d) => { if (d.groups) setGroups(d.groups) })
+      .finally(() => setGroupsLoading(false))
+  }, [syncMode, icloudPhase])
 
   async function requestNotifications() {
     const permission = await Notification.requestPermission()
@@ -129,7 +152,14 @@ export default function SettingsPage() {
     setSyncError('')
     const body: Record<string, unknown> = {}
     if (syncMode === 'lists') {
-      body.selected_books = selectedBooks
+      // Resolve group member UIDs
+      const memberUids = groups
+        .filter((g) => selectedGroups.includes(g.uid))
+        .flatMap((g) => g.memberUids)
+      const uniqueUids = [...new Set(memberUids)]
+      body.selected_contacts = uniqueUids
+      body.selected_books = []
+      body.selected_groups = selectedGroups // saved for UI restoration
     } else if (syncMode === 'contacts') {
       body.selected_books = []
       body.selected_contacts = selectedContacts
@@ -162,6 +192,8 @@ export default function SettingsPage() {
     setBooks([])
     setSelectedBooks([])
     setSelectedContacts([])
+    setGroups([])
+    setSelectedGroups([])
     setExpandedBook(null)
     setBookContacts({})
     setIcloudPhase('form')
@@ -188,6 +220,12 @@ export default function SettingsPage() {
     )
   }
 
+  function toggleGroup(uid: string) {
+    setSelectedGroups((prev) =>
+      prev.includes(uid) ? prev.filter((u) => u !== uid) : [...prev, uid],
+    )
+  }
+
   function toggleContact(uid: string) {
     setSelectedContacts((prev) =>
       prev.includes(uid) ? prev.filter((u) => u !== uid) : [...prev, uid],
@@ -200,8 +238,13 @@ export default function SettingsPage() {
   function selectionSummary() {
     if (syncMode === 'all') return 'All contacts'
     if (syncMode === 'lists') {
-      if (selectedBooks.length === 0) return 'No lists selected'
-      return `${selectedBooks.length} list${selectedBooks.length !== 1 ? 's' : ''} selected`
+      if (selectedGroups.length === 0) return 'No groups selected'
+      const names = groups
+        .filter((g) => selectedGroups.includes(g.uid))
+        .map((g) => g.name)
+      return names.length > 0
+        ? names.join(', ')
+        : `${selectedGroups.length} group${selectedGroups.length !== 1 ? 's' : ''} selected`
     }
     if (selectedContacts.length === 0) return 'No contacts selected'
     return `${selectedContacts.length} contact${selectedContacts.length !== 1 ? 's' : ''} selected`
@@ -363,52 +406,33 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                {/* Lists mode: checkboxes per book with Browse button */}
-                {syncMode === 'lists' && books.length > 0 && (
+                {/* Lists mode: iCloud groups (KIND:group vCards) */}
+                {syncMode === 'lists' && (
                   <div className="border border-gray-200 rounded-lg overflow-hidden">
-                    {books.map((book, i) => (
-                      <div key={book.url} className={i > 0 ? 'border-t border-gray-100' : ''}>
-                        <div className="flex items-center gap-2 px-3 py-2.5">
-                          <input
-                            type="checkbox"
-                            id={`book-list-${book.url}`}
-                            checked={selectedBooks.includes(book.url)}
-                            onChange={() => toggleBook(book.url)}
-                            className="rounded shrink-0"
-                          />
-                          <label htmlFor={`book-list-${book.url}`} className="flex-1 text-sm text-gray-700 cursor-pointer">
-                            {book.name}
-                          </label>
-                          <button
-                            onClick={() => handleLoadContacts(book.url)}
-                            className="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1 shrink-0"
-                          >
-                            <List className="w-3 h-3" />
-                            Browse
-                            {expandedBook === book.url
-                              ? <ChevronUp className="w-3 h-3" />
-                              : <ChevronDown className="w-3 h-3" />
-                            }
-                          </button>
-                        </div>
-                        {expandedBook === book.url && (
-                          <div className="border-t border-gray-100 bg-gray-50 px-4 py-2 space-y-1 max-h-48 overflow-y-auto">
-                            {contactsLoading && !bookContacts[book.url] ? (
-                              <p className="text-xs text-gray-400 py-1">Loading contacts...</p>
-                            ) : (bookContacts[book.url] ?? []).length === 0 ? (
-                              <p className="text-xs text-gray-400 py-1">No contacts found</p>
-                            ) : (
-                              (bookContacts[book.url] ?? []).map((c) => (
-                                <div key={c.uid} className="text-xs text-gray-600 py-0.5">
-                                  <span className="font-medium">{c.name}</span>
-                                  {c.email && <span className="text-gray-400 ml-1">· {c.email}</span>}
-                                </div>
-                              ))
-                            )}
-                          </div>
-                        )}
+                    {groupsLoading ? (
+                      <div className="px-3 py-4 text-xs text-gray-400 text-center">Loading groups...</div>
+                    ) : groups.length === 0 ? (
+                      <div className="px-3 py-4 text-xs text-gray-400 text-center">
+                        No groups found in iCloud Contacts
                       </div>
-                    ))}
+                    ) : (
+                      groups.map((group, i) => (
+                        <div key={group.uid} className={i > 0 ? 'border-t border-gray-100' : ''}>
+                          <label className="flex items-center gap-2 px-3 py-2.5 cursor-pointer hover:bg-gray-50">
+                            <input
+                              type="checkbox"
+                              checked={selectedGroups.includes(group.uid)}
+                              onChange={() => toggleGroup(group.uid)}
+                              className="rounded shrink-0"
+                            />
+                            <span className="flex-1 text-sm text-gray-700">{group.name}</span>
+                            <span className="text-xs text-gray-400 shrink-0">
+                              {group.memberUids.length} {group.memberUids.length === 1 ? 'contact' : 'contacts'}
+                            </span>
+                          </label>
+                        </div>
+                      ))
+                    )}
                   </div>
                 )}
 
@@ -469,7 +493,7 @@ export default function SettingsPage() {
                     onClick={handleSync}
                     loading={syncing}
                     disabled={
-                      (syncMode === 'lists' && selectedBooks.length === 0) ||
+                      (syncMode === 'lists' && selectedGroups.length === 0) ||
                       (syncMode === 'contacts' && selectedContacts.length === 0)
                     }
                   >
@@ -504,10 +528,12 @@ export default function SettingsPage() {
                 <div className="text-xs text-gray-500">
                   Syncing:{' '}
                   <span className="font-medium text-gray-700">
-                    {selectedContacts.length > 0
-                      ? `${selectedContacts.length} specific contact${selectedContacts.length !== 1 ? 's' : ''}`
-                      : selectedBooks.length > 0
-                        ? `${selectedBooks.length} list${selectedBooks.length !== 1 ? 's' : ''}`
+                    {selectedGroups.length > 0
+                      ? (groups.length > 0
+                          ? groups.filter((g) => selectedGroups.includes(g.uid)).map((g) => g.name).join(', ')
+                          : `${selectedGroups.length} group${selectedGroups.length !== 1 ? 's' : ''}`)
+                      : selectedContacts.length > 0
+                        ? `${selectedContacts.length} specific contact${selectedContacts.length !== 1 ? 's' : ''}`
                         : 'All contacts'}
                   </span>
                 </div>
